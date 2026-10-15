@@ -23,6 +23,7 @@ loguru>=0.7.0
 
 # MCP相关
 fastmcp>=2.0.0
+mcp>=1.0.0,<2.0.0
 uv>=0.8.0
 
 # 其他工具
@@ -32,3 +33,4 @@ huggingface_hub>=0.25.0
 # LangGraph rewrite
 langgraph>=0.2.70
 langchain-openai>=0.2.0
+langgraph-checkpoint-sqlite>=3.0.0
