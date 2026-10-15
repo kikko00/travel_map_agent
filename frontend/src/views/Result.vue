@@ -5,14 +5,14 @@
       <a-button class="back-button" size="large" @click="goBack">
         ← 返回首页
       </a-button>
-      <a-space size="middle">
-        <a-button v-if="!editMode" @click="toggleEditMode" type="default">
+      <a-space v-if="tripPlan" size="middle">
+        <a-button v-if="!editMode" :disabled="chatBusy" @click="toggleEditMode" type="default">
           ✏️ 编辑行程
         </a-button>
-        <a-button v-else @click="saveChanges" type="primary">
+        <a-button v-else :loading="chatBusy" @click="saveChanges" type="primary">
           💾 保存修改
         </a-button>
-        <a-button v-if="editMode" @click="cancelEdit" type="default">
+        <a-button v-if="editMode" :disabled="chatBusy" @click="cancelEdit" type="default">
           ❌ 取消编辑
         </a-button>
 
@@ -34,6 +34,9 @@
         </a-dropdown>
       </a-space>
     </div>
+
+    <ChatPanel :session="conversation" :busy="chatBusy" :disabled="editMode" :can-adopt="Boolean(tripPlan)"
+      @send="sendChat" @select="restoreConversation" @adopt="adoptPlan" />
 
     <div v-if="tripPlan" class="content-wrapper">
       <!-- 侧边导航 -->
@@ -308,16 +311,23 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { DownOutlined } from '@ant-design/icons-vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
 import type { TripPlan } from '@/types'
+import type { Conversation } from '@/types/conversation'
+import ChatPanel from '@/components/ChatPanel.vue'
+import apiClient, { createConversation, getConversation, sendConversationMessage, saveConversationPlan } from '@/services/api'
 
 const router = useRouter()
+const route = useRoute()
+const conversation = ref<Conversation | null>(null)
+const chatBusy = ref(false)
+let mounted = true
 const tripPlan = ref<TripPlan | null>(null)
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
@@ -325,18 +335,80 @@ const attractionPhotos = ref<Record<string, string>>({})
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
 let map: any = null
+let mapGeneration = 0
+const escapeHtml = (value: unknown): string => String(value).replace(/[&<>"']/g, character =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character] || character))
 
 onMounted(async () => {
+  const id = String(route.query.conversation || localStorage.getItem('conversationId') || '')
+  if (id) {
+    await restoreConversation(id)
+    return
+  }
   const data = sessionStorage.getItem('tripPlan')
   if (data) {
     tripPlan.value = JSON.parse(data)
     // 加载景点图片
-    await loadAttractionPhotos()
+    void loadAttractionPhotos()
     // 等待DOM渲染完成后初始化地图
     await nextTick()
     initMap()
   }
 })
+
+onUnmounted(() => { mounted = false; map?.destroy() })
+
+async function applyConversation(value: Conversation) {
+  if (!mounted) return
+  conversation.value = value
+  tripPlan.value = value.plan
+  attractionPhotos.value = {}
+  sessionStorage.setItem('tripPlan', JSON.stringify(value.plan))
+  localStorage.setItem('conversationId', value.id)
+  await router.replace({ path: '/result', query: { conversation: value.id } })
+  void loadAttractionPhotos()
+  await nextTick()
+  map?.destroy()
+  if (mounted) void initMap()
+}
+
+function showChatError(error: any) {
+  message.error(error.response?.data?.detail || error.message || '操作失败，请稍后重试')
+}
+
+async function restoreConversation(id: string) {
+  if (chatBusy.value || editMode.value) return
+  chatBusy.value = true
+  try { await applyConversation(await getConversation(id)) }
+  catch (error: any) {
+    showChatError(error)
+    if (error.response?.status === 404) localStorage.removeItem('conversationId')
+  } finally { chatBusy.value = false }
+}
+
+async function sendChat(content: string) {
+  if (!conversation.value || chatBusy.value || editMode.value) return
+  chatBusy.value = true
+  try {
+    await applyConversation(await sendConversationMessage(conversation.value.id, content, conversation.value.version))
+  } catch (error: any) {
+    showChatError(error)
+    if (error.response?.status === 409) await applyConversation(await getConversation(conversation.value.id))
+  } finally { chatBusy.value = false }
+}
+
+async function adoptPlan() {
+  if (!tripPlan.value || chatBusy.value) return
+  const plan = tripPlan.value
+  chatBusy.value = true
+  try {
+    await applyConversation(await createConversation({ city: plan.city, start_date: plan.start_date,
+      end_date: plan.end_date, travel_days: plan.days.length,
+      transportation: plan.days[0]?.transportation || '公共交通',
+      accommodation: plan.days[0]?.accommodation || '经济型酒店', preferences: [], free_text_input: '' }, plan))
+  } catch (error: any) { showChatError(error) }
+  finally { chatBusy.value = false }
+}
 
 const goBack = () => {
   router.push('/')
@@ -360,21 +432,28 @@ const toggleEditMode = () => {
 }
 
 // 保存修改
-const saveChanges = () => {
-  editMode.value = false
-  // 更新sessionStorage
-  if (tripPlan.value) {
-    sessionStorage.setItem('tripPlan', JSON.stringify(tripPlan.value))
-  }
-  message.success('修改已保存')
-
-  // 重新初始化地图以反映更改
-  if (map) {
-    map.destroy()
-  }
-  nextTick(() => {
-    initMap()
-  })
+const saveChanges = async () => {
+  if (chatBusy.value || !tripPlan.value) return
+  chatBusy.value = true
+  try {
+    if (conversation.value) {
+      const saved = await saveConversationPlan(conversation.value.id, tripPlan.value, conversation.value.version)
+      await applyConversation(saved)
+    } else {
+      sessionStorage.setItem('tripPlan', JSON.stringify(tripPlan.value))
+      map?.destroy()
+      await nextTick()
+      void initMap()
+    }
+    editMode.value = false
+    message.success('修改已保存')
+  } catch (error: any) {
+    showChatError(error)
+    if (error.response?.status === 409 && conversation.value) {
+      await applyConversation(await getConversation(conversation.value.id))
+      editMode.value = false
+    }
+  } finally { chatBusy.value = false }
 }
 
 // 取消编辑
@@ -432,8 +511,8 @@ const loadAttractionPhotos = async () => {
 
   tripPlan.value.days.forEach(day => {
     day.attractions.forEach(attraction => {
-      const promise = fetch(`http://localhost:8000/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
-        .then(res => res.json())
+      const promise = apiClient.get('/api/poi/photo', { params: { name: attraction.name }, timeout: 10000 })
+        .then(res => res.data)
         .then(data => {
           if (data.success && data.data.photo_url) {
             attractionPhotos.value[attraction.name] = data.data.photo_url
@@ -477,7 +556,7 @@ const getAttractionImage = (name: string, index: number): string => {
       </linearGradient>
     </defs>
     <rect width="400" height="300" fill="url(#grad${index})"/>
-    <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="24" font-weight="bold" fill="white">${name}</text>
+    <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="24" font-weight="bold" fill="white">${escapeHtml(name)}</text>
   </svg>`
 
   return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`
@@ -787,50 +866,9 @@ const exportAsPDF = async () => {
 }
 
 // 截取地图图片
-const captureMapImage = async () => {
-  if (!map) return
-
-  try {
-    // 获取地图容器
-    const mapContainer = document.getElementById('amap-container')
-    if (!mapContainer) return
-
-    // 使用高德地图的截图功能
-    const mapCanvas = mapContainer.querySelector('canvas')
-    if (mapCanvas) {
-      // 创建一个img元素替换地图容器
-      const img = document.createElement('img')
-      img.src = mapCanvas.toDataURL('image/png')
-      img.style.width = '100%'
-      img.style.height = '500px'
-      img.style.objectFit = 'cover'
-      img.id = 'map-snapshot'
-
-      // 隐藏原地图,显示截图
-      mapContainer.style.display = 'none'
-      mapContainer.parentElement?.appendChild(img)
-    }
-  } catch (error) {
-    console.error('截取地图失败:', error)
-  }
-}
-
-// 恢复地图
-const restoreMap = () => {
-  const mapContainer = document.getElementById('amap-container')
-  const snapshot = document.getElementById('map-snapshot')
-
-  if (mapContainer) {
-    mapContainer.style.display = 'block'
-  }
-
-  if (snapshot) {
-    snapshot.remove()
-  }
-}
-
 // 初始化地图
 const initMap = async () => {
+  const generation = ++mapGeneration
   try {
     const AMap = await AMapLoader.load({
       key: import.meta.env.VITE_AMAP_WEB_JS_KEY,  // 高德地图Web端(JS API) Key
@@ -838,6 +876,7 @@ const initMap = async () => {
       plugins: ['AMap.Marker', 'AMap.Polyline', 'AMap.InfoWindow']
     })
 
+    if (!mounted || generation !== mapGeneration) return
     // 创建地图实例
     map = new AMap.Map('amap-container', {
       zoom: 12,
@@ -890,10 +929,10 @@ const addAttractionMarkers = (AMap: any) => {
     const infoWindow = new AMap.InfoWindow({
       content: `
         <div style="padding: 10px;">
-          <h4 style="margin: 0 0 8px 0;">${attraction.name}</h4>
-          <p style="margin: 4px 0;"><strong>地址:</strong> ${attraction.address}</p>
+          <h4 style="margin: 0 0 8px 0;">${escapeHtml(attraction.name)}</h4>
+          <p style="margin: 4px 0;"><strong>地址:</strong> ${escapeHtml(attraction.address)}</p>
           <p style="margin: 4px 0;"><strong>游览时长:</strong> ${attraction.visit_duration}分钟</p>
-          <p style="margin: 4px 0;"><strong>描述:</strong> ${attraction.description}</p>
+          <p style="margin: 4px 0;"><strong>描述:</strong> ${escapeHtml(attraction.description)}</p>
           <p style="margin: 4px 0; color: #1890ff;"><strong>第${attraction.dayIndex + 1}天 景点${attraction.attrIndex + 1}</strong></p>
         </div>
       `,

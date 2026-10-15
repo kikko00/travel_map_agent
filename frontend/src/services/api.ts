@@ -1,11 +1,13 @@
 import axios from 'axios'
 import type { TripFormData, TripPlanResponse } from '@/types'
+import type { TripPlan } from '@/types'
+import type { Conversation, ConversationSummary } from '@/types/conversation'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 120000, // 2分钟超时
+  timeout: 600000, // 首次规划包含地图查询及最多两次模型调用
   headers: {
     'Content-Type': 'application/json'
   }
@@ -62,4 +64,24 @@ export async function healthCheck(): Promise<any> {
 }
 
 export default apiClient
+
+export async function createConversation(request: TripFormData, plan?: TripPlan): Promise<Conversation> {
+  return (await apiClient.post('/api/conversations', { request, plan })).data
+}
+
+export async function listConversations(): Promise<ConversationSummary[]> {
+  return (await apiClient.get('/api/conversations')).data
+}
+
+export async function getConversation(id: string): Promise<Conversation> {
+  return (await apiClient.get(`/api/conversations/${id}`)).data
+}
+
+export async function sendConversationMessage(id: string, content: string, version: number): Promise<Conversation> {
+  return (await apiClient.post(`/api/conversations/${id}/messages`, { content, expected_version: version })).data
+}
+
+export async function saveConversationPlan(id: string, plan: TripPlan, version: number): Promise<Conversation> {
+  return (await apiClient.patch(`/api/conversations/${id}/plan`, { plan, expected_version: version })).data
+}
 

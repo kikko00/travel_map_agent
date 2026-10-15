@@ -14,6 +14,7 @@
       </div>
       <h1 class="page-title">智能旅行助手</h1>
       <p class="page-subtitle">基于AI的个性化旅行规划,让每一次出行都完美无忧</p>
+      <a-button style="margin-top: 16px" @click="router.push('/result')">查看历史会话</a-button>
     </div>
 
     <a-card class="form-card" :bordered="false">
@@ -207,7 +208,7 @@
 import { ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
-import { generateTripPlan } from '@/services/api'
+import { createConversation } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
@@ -216,7 +217,7 @@ const loading = ref(false)
 const loadingProgress = ref(0)
 const loadingStatus = ref('')
 
-const formData = reactive<TripFormData & { start_date: Dayjs | null; end_date: Dayjs | null }>({
+const formData = reactive<Omit<TripFormData, 'start_date' | 'end_date'> & { start_date: Dayjs | null; end_date: Dayjs | null }>({
   city: '',
   start_date: null,
   end_date: null,
@@ -283,28 +284,29 @@ const handleSubmit = async () => {
       free_text_input: formData.free_text_input
     }
 
-    const response = await generateTripPlan(requestData)
+    const conversation = await createConversation(requestData)
 
     clearInterval(progressInterval)
     loadingProgress.value = 100
     loadingStatus.value = '✅ 完成!'
 
-    if (response.success && response.data) {
+    if (conversation.plan) {
       // 保存到sessionStorage
-      sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
+      sessionStorage.setItem('tripPlan', JSON.stringify(conversation.plan))
+      localStorage.setItem('conversationId', conversation.id)
 
       message.success('旅行计划生成成功!')
 
       // 短暂延迟后跳转
       setTimeout(() => {
-        router.push('/result')
+        router.push({ path: '/result', query: { conversation: conversation.id } })
       }, 500)
     } else {
-      message.error(response.message || '生成失败')
+      message.error('生成失败')
     }
   } catch (error: any) {
     clearInterval(progressInterval)
-    message.error(error.message || '生成旅行计划失败,请稍后重试')
+    message.error(error.response?.data?.detail || error.message || '生成旅行计划失败,请稍后重试')
   } finally {
     setTimeout(() => {
       loading.value = false
