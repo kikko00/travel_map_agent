@@ -47,8 +47,8 @@ explicit and inspectable:
 - Each node has one responsibility.
 - `validate_plan` uses the existing Pydantic `TripPlan` model as the contract.
 - `repair_plan` demonstrates conditional routing and output recovery.
-- A fallback plan keeps the API usable when map data, model access, or validation
-  fails.
+- Model timeouts return HTTP 504; upstream/output failures return HTTP 502.
+  Empty outputs never trigger repair, and malformed nonempty outputs are repaired once.
 
 ## Interview Talking Points
 
@@ -59,8 +59,8 @@ explicit and inspectable:
 3. LangChain is used for model integration through `ChatOpenAI`; LangGraph owns
    orchestration and state transitions.
 4. Pydantic validation prevents malformed LLM JSON from leaking to the frontend.
-5. The graph has a repair path and a deterministic fallback path, so failures are
-   handled intentionally.
+5. The graph has a bounded repair path and explicit service errors, so failed
+   model calls cannot be presented as successful placeholder itineraries.
 
 ## Run
 

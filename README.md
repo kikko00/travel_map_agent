@@ -250,7 +250,7 @@ GET  /api/poi/photo        获取景点图片
 3. LangGraph 将复杂任务拆成多个节点，每个节点只负责一个明确职责。
 4. LangChain 负责接入 OpenAI 兼容模型，LangGraph 负责任务编排和状态流转。
 5. 使用 Pydantic 对 LLM 输出做结构化校验，避免错误 JSON 直接返回前端。
-6. 当校验失败时，工作流会进入 `repair_plan` 节点尝试修复；仍失败则返回 fallback 行程，保证接口可用性。
+6. 非空输出校验失败时进入 `repair_plan` 修复一次；超时或修复仍失败会明确返回服务错误，避免将占位数据当作成功行程。
 7. 前端结果页不仅展示文本，还结合地图、图片、预算和导出能力，形成完整用户体验。
 
 一句话总结：
@@ -272,6 +272,71 @@ GET  /api/poi/photo        获取景点图片
 
 ## 常见问题
 
+### 模型响应超时
+
+在 `backend/.env` 设置 `LLM_TIMEOUT=120`（每次模型调用的读取等待时间，秒）及 `LLM_MAX_RETRIES=0`。
+修改后重启后端。连接超时单独设为10秒，SDK默认不再自动重试；前端规划等待时间为10分钟，包含地图查询和必要的输出修复。
+服务日志使用 `trip` 请求编号记录生成/修复阶段、提示词字符数和调用耗时，不打印密钥或完整提示词。
+模型超时返回 HTTP 504，模型调用或输出失败返回 HTTP 502，不再返回占位行程或将空输出送入修复节点。
+仅非空但格式或行程约束错误的输出修复一次；无效请求日期或日期与天数不匹配会在调用模型前返回 HTTP 422。
+更长等待不能保证上游模型可用；仍超时时可缩短旅行天数，或检查模型服务与网络。
+
+### 多轮对话、历史会话与联网检索
+
+首页生成行程时创建后端会话；结果页可继续发送需求，例如“第二天换成博物馆，其他日期不变”或“博物馆几点开放，需要预约吗”。
+首页的“查看历史会话”与结果页下拉框可恢复历史记录，刷新或重启后端后仍可读取。
+旧版浏览器行程可点击“将当前行程保存为会话”迁移。手动编辑保存后也会同步至后端，并重算预算。
+
+在 `backend/.env` 配置 `TAVILY_API_KEY`，然后重启后端。检索工具通过 LangChain 工具绑定由模型按需调用，
+提供开放时间、预约要求及出行公告的参考来源，不代为预约或购票。信息来自搜索摘要时会注明待核实；
+缺少密钥或检索失败不会编造规则。当前模型必须支持 OpenAI 兼容的工具调用（tool_calls）。
+
+新增 API：
+
+```text
+POST  /api/conversations                  创建会话（request 为原 TripRequest，plan 可用于迁移已有行程）
+GET   /api/conversations                  会话列表
+GET   /api/conversations/{id}             恢复会话及行程
+POST  /api/conversations/{id}/messages     {content, expected_version}
+PATCH /api/conversations/{id}/plan         {plan, expected_version}
+```
+
+SQLite 默认保存在 `backend/data/`，包含会话快照、LangGraph checkpoints 和一小时的搜索缓存，已加入 Git 忽略。
+可用 `CONVERSATION_DATA_DIR` 自定义目录。当前面向本地单用户、单后端实例；未加入账户鉴权，历史接口展示本实例的全部会话。
+相同会话的更新串行执行，版本过期返回 HTTP 409；新城市或新日期范围应另建会话。
+对话失败时保留原行程；超长对话向模型提供最近十二条消息及持久化需求约束，数据库保存完整可见历史。
+
+更新依赖与运行测试：
+
+```powershell
+uv pip install --python .\.venv\Scripts\python.exe -r backend\requirements.txt
+cd backend
+..\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_conversation*.py"
+```
+
+### 高德 MCP 出现 `Event loop is closed` 或工具数量为 0
+
+当前高德服务使用官方 MCP Python SDK 管理 stdio 会话，在事件循环关闭前退出会话和子进程。
+`amap-mcp-server==0.1.11` 固定依赖 `mcp==1.8.1`，与较新的 Pydantic 存在导入兼容问题，
+因此子进程使用 `uvx --with pydantic==2.10.6 amap-mcp-server==0.1.11`。
+该版本限制仅作用于 uvx 的独立环境，不影响后端的 Pydantic。
+
+在项目根目录运行真实 MCP 测试（需要网络和有效的 Web 服务 Key）：
+
+```powershell
+.\.venv\Scripts\python.exe backend\test_amap_mcp.py
+```
+
+测试会列出工具并查询杭州景点和天气。启动或工具调用失败会明确报错，不再将空工具列表打印为初始化成功。
+修改后停止旧后端，再从 `backend` 目录运行 `..\.venv\Scripts\python.exe run.py`。
+
+本地回归测试不需要高德密钥或网络：
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -m unittest discover -s tests -p test_amap_mcp.py
+```
+
 ### 为什么保留 HelloAgents 代码？
 
 保留 `backend/app/agents/trip_planner_agent.py` 是为了学习对比。你可以比较两种实现：
@@ -283,9 +348,9 @@ GET  /api/poi/photo        获取景点图片
 
 LLM 输出具有不确定性，可能出现字段缺失、类型错误或 JSON 格式错误。Pydantic 可以把“模型输出”约束成前端可安全使用的数据结构。
 
-### 为什么需要 fallback？
+### 模型失败后会返回 fallback 吗？
 
-地图工具、模型接口、网络请求都有可能失败。fallback 可以保证后端接口不直接崩溃，前端仍能拿到一个可展示的基础行程。
+当前接口不再用 fallback 隐藏模型超时或无效输出，而是返回明确错误；已有会话行程保持不变。fallback 构造函数保留作测试和历史参考。
 
 ## License
 
