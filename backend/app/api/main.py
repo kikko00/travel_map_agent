@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
-from .routes import trip, poi, map as map_routes
+from .routes import trip, poi, conversation, map as map_routes
 
 # 获取配置
 settings = get_settings()
@@ -30,6 +30,7 @@ app.add_middleware(
 app.include_router(trip.router, prefix="/api")
 app.include_router(poi.router, prefix="/api")
 app.include_router(map_routes.router, prefix="/api")
+app.include_router(conversation.router, prefix="/api")
 
 
 @app.on_event("startup")
@@ -60,6 +61,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭事件"""
+    from ..services.conversation_service import close_conversation_service
+    close_conversation_service()
     print("\n" + "="*60)
     print("👋 应用正在关闭...")
     print("="*60 + "\n")
