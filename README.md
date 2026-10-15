@@ -1,358 +1,334 @@
-# Travel Agent 智能旅行规划助手
+# Travel Agent · 基于高德地图 MCP 的智能旅行规划 Agent
 
-这是一个面向学习和面试展示的 AI 旅行规划项目。项目采用前后端分离架构，前端负责收集用户旅行需求和展示结果，后端负责调用大模型、地图工具和 LangGraph 工作流生成结构化行程。
+根据目的地、出行日期与个人偏好生成旅行方案，通过多轮对话持续调整行程，并联网查询景点开放时间和预约要求。
 
-当前版本已将核心规划链路改写为 LangGraph 工作流，同时保留原有 HelloAgents 相关代码作为对照参考，方便学习不同 Agent 架构的实现方式。
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)
+![LangGraph](https://img.shields.io/badge/Agent-LangGraph-1C3C3C)
+![Vue](https://img.shields.io/badge/Frontend-Vue_3-4FC08D?logo=vuedotjs&logoColor=white)
+![SQLite](https://img.shields.io/badge/Storage-SQLite-003B57?logo=sqlite&logoColor=white)
 
-## 项目亮点
+**地图资料查询 → 结构化行程生成 → 多轮需求补充 → 联网核实与局部调整**
 
-- 前后端分离：Vue 3 + TypeScript 前端，FastAPI 后端。
-- LangGraph 工作流：将旅行规划拆分为景点搜索、天气查询、酒店搜索、行程生成、结果校验和修复等节点。
-- LangChain 模型集成：通过 `langchain-openai` 接入 OpenAI 兼容模型。
-- 高德地图 MCP 工具：用于 POI 搜索、天气查询、路线规划等地图能力。
-- 结构化输出：使用 Pydantic 模型约束最终返回的 `TripPlan`。
-- 结果页能力完整：支持每日行程、预算、天气、地图标记、景点图片、编辑行程和导出 PDF/图片。
+[功能概览](#功能概览) · [架构与工作流](#架构与工作流) · [快速开始](#快速开始) · [使用示例](#使用示例) · [API](#api) · [测试](#测试) · [常见问题](#常见问题)
 
-## 技术栈
+## 功能概览
 
-### 后端
+| 功能 | 实现内容 |
+| --- | --- |
+| 个性化规划 | 根据城市、日期、交通与住宿偏好，生成每日景点、餐饮、酒店、天气与预算 |
+| 地图工具集成 | 通过 MCP 查询高德景点、天气和酒店资料；调整景点时补充候选 POI 与详情 |
+| 多轮会话 | 保存对话、需求约束与规划状态，支持历史恢复、需求追加、旧约束撤销与替换 |
+| 局部行程修改 | 按指定日期和授权字段合并修改，保留其他日期及未要求改动的酒店、餐饮 |
+| 联网检索 | 模型按需调用 Tavily，查询开放时间、预约规则和公告，展示来源链接与检索时间 |
+| 可视化与导出 | 地图标记、天气和预算展示、Unsplash 配图、手动编辑、图片及 PDF 导出 |
+| 输出校验 | JSON Schema 提示、Pydantic 解析与业务一致性校验，非空错误输出最多修复一次 |
 
-- Python 3.10+
-- FastAPI
-- LangGraph
-- LangChain / langchain-openai
-- Pydantic
-- HelloAgents
-- 高德地图 MCP 服务 `amap-mcp-server`
-- Uvicorn
+## 架构与工作流
 
-### 前端
+### 技术分工
 
-- Vue 3
-- TypeScript
-- Vite
-- Ant Design Vue
-- Axios
-- 高德地图 JavaScript API
-- html2canvas
-- jsPDF
+| 层级 | 技术 | 职责 |
+| --- | --- | --- |
+| 前端 | Vue 3、TypeScript、Ant Design Vue、Vite | 需求表单、会话交互与结果展示 |
+| API | FastAPI、Pydantic | 接口、输入校验与结构化数据模型 |
+| 模型 | LangChain / langchain-openai | 接入 OpenAI 兼容模型，绑定联网工具 |
+| 工作流 | LangGraph、ToolNode | 状态传递、条件路由、工具执行与结果处理 |
+| 地图 | MCP Python SDK、高德 MCP、高德 JS API | 后端地图查询与浏览器地图展示 |
+| 外部信息 | Tavily、Unsplash | 联网检索与景点配图 |
+| 存储 | SQLite、LangGraph SQLite Checkpointer | 会话快照、工作流检查点与检索缓存 |
+
+### 首次生成行程
+
+首页通过 `POST /api/conversations` 创建会话，调用规划工作流并保存结果。
+
+```mermaid
+flowchart LR
+    A[旅行需求] --> B[景点搜索]
+    B --> C[天气查询]
+    C --> D[酒店搜索]
+    D --> E[模型生成行程]
+    E --> F[结构与一致性校验]
+    E -->|超时或空输出| X[返回服务错误]
+    F -->|通过| G[保存会话并展示]
+    F -->|首次校验失败| H[模型修复一次]
+    H --> F
+    F -->|修复后仍失败| X
+```
+
+模型超时或返回空内容会直接终止；修复后仍不合格会返回明确错误，不保存占位行程。校验涵盖字段结构、城市、日期范围、天数与每日序号。
+
+### 多轮对话与工具调用
+
+```mermaid
+flowchart TD
+    A[用户追加消息] --> B[恢复状态与识别意图]
+    B -->|需求不明确| C[请求澄清]
+    B -->|回答或调整| D[按需补充地图资料]
+    D --> E[模型处理]
+    E -->|需要检索| F[ToolNode 执行 Tavily 工具]
+    F --> E
+    E -->|最终回答或修改方案| G[校验与字段级合并]
+    C --> H[保存对话与状态]
+    G --> H
+    H --> I[更新行程与引用来源]
+```
+
+- **记忆机制**：SQLite 保存完整可见历史、有效约束与当前行程；LangGraph 按会话 ID 保存检查点。模型上下文使用最近 12 条历史消息及持久化约束。
+- **工具调用**：通过 `bind_tools()` 绑定联网工具，模型按需选择；每轮对话最多执行 3 轮工具调用。
+- **写入保护**：同会话写入串行执行，使用 `expected_version` 防止旧页面覆盖新结果。
+- **预算更新**：修改后重算门票、酒店与餐饮费用，交通费用沿用已有估算。
+
+## 快速开始
+
+以下以 **Windows PowerShell、Python 3.11 与 uv** 为例，另需安装 Node.js 和 npm。模型服务须支持 OpenAI 兼容接口，多轮对话还需要支持工具调用（`tool_calls`）。
+
+### 1. 克隆与安装
+
+```powershell
+git clone https://github.com/kikko00/travel_agent.git
+cd travel_agent
+
+uv python install 3.11
+uv venv --python 3.11 .venv
+uv pip install --python .\.venv\Scripts\python.exe -r .\backend\requirements.txt requests
+```
+
+后端通过 `requirements.txt` 管理依赖，由 uv 创建环境并安装。无需激活 Conda 或 `.venv`。
+
+### 2. 创建配置文件
+
+```powershell
+if (!(Test-Path .\backend\.env)) {
+    Copy-Item .\backend\.env.example .\backend\.env
+}
+if (!(Test-Path .\frontend\.env)) {
+    Copy-Item .\frontend\.env.example .\frontend\.env
+}
+```
+
+编辑 `backend/.env`：
+
+```dotenv
+# 必填：高德 Web 服务类型 Key
+AMAP_API_KEY=your-amap-web-service-key
+
+# 必填：OpenAI 兼容模型服务
+LLM_API_KEY=your-model-api-key
+LLM_BASE_URL=https://your-model-provider.example/v1
+LLM_MODEL_ID=your-model-name
+LLM_TIMEOUT=120
+LLM_MAX_RETRIES=0
+
+# 联网检索功能需要
+TAVILY_API_KEY=your-tavily-api-key
+
+# 景点配图功能需要；未配置时使用占位图
+UNSPLASH_ACCESS_KEY=your-unsplash-access-key
+```
+
+编辑 `frontend/.env`：
+
+```dotenv
+VITE_API_BASE_URL=http://localhost:8000
+VITE_AMAP_WEB_JS_KEY=your-amap-javascript-api-key
+```
+
+| 配置 | 获取与用途 |
+| --- | --- |
+| `AMAP_API_KEY` | [高德控制台](https://console.amap.com/)申请 **Web 服务** Key，供后端查询使用 |
+| `VITE_AMAP_WEB_JS_KEY` | 高德控制台申请 **JavaScript API** Key，供页面地图使用；与后端 Key 分开配置 |
+| `LLM_*` | 填写所选模型提供商的密钥、接口地址和模型名称 |
+| `TAVILY_API_KEY` | [Tavily](https://app.tavily.com/)获取，用于联网检索 |
+| `UNSPLASH_ACCESS_KEY` | [Unsplash Developers](https://unsplash.com/developers)创建应用获取 Access Key，用于图片搜索 |
+
+`.env`、数据库、虚拟环境和构建产物已加入 Git 忽略。不要将真实密钥填写到 `.env.example`。
+
+### 3. 启动后端
+
+在项目根目录执行：
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -X utf8 run.py
+```
+
+从 `backend` 目录启动以正确读取 `.env`；`-X utf8` 避免部分 Windows 终端打印中文或 emoji 时编码失败。
+
+### 4. 启动前端
+
+另开终端，进入项目根目录：
+
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
+
+| 入口 | 地址 |
+| --- | --- |
+| 应用页面 | [localhost:5173](http://localhost:5173/) |
+| API 文档 | [localhost:8000/docs](http://localhost:8000/docs) |
+| 健康检查 | [localhost:8000/health](http://localhost:8000/health) |
+
+按 **Ctrl+C** 停止对应服务。修改后端 `.env` 后需重启后端。
+
+## 使用示例
+
+1. **生成行程**：填写“杭州、三日游、公共交通、经济型酒店、自然风光”等需求。
+2. **追加需求**：“记住我不喜欢爬山，后续安排轻松一点。”
+3. **局部调整**：“第二天换成博物馆，其他日期和酒店保持不变。”
+4. **联网查询**：“浙江省博物馆几点开放，需要预约吗？只回答，不修改行程。”
+5. **更新约束**：“撤销不要爬山的要求，可以安排轻度徒步。”
+6. **恢复历史**：首页点击“查看历史会话”，或在结果页选择历史记录；刷新页面、重启后端后仍可恢复。
+
+旧版仅保存在浏览器中的行程，可点击“将当前行程保存为会话”迁移。手动编辑时先保存或取消，再继续对话。
 
 ## 项目结构
 
 ```text
-helloagents-trip-planner/
+travel_agent/
 ├── backend/
 │   ├── app/
-│   │   ├── agents/
-│   │   │   └── trip_planner_agent.py      # 原 HelloAgents 版本，作为学习对照
-│   │   ├── api/
-│   │   │   ├── main.py                    # FastAPI 应用入口
-│   │   │   └── routes/
-│   │   │       ├── trip.py                # 行程规划 API
-│   │   │       ├── map.py                 # 地图相关 API
-│   │   │       └── poi.py                 # POI 与图片相关 API
+│   │   ├── api/routes/           # 旅行、会话、地图与图片接口
 │   │   ├── graphs/
-│   │   │   └── trip_graph.py              # LangGraph 行程规划工作流
-│   │   ├── models/
-│   │   │   └── schemas.py                 # Pydantic 请求/响应模型
+│   │   │   ├── trip_graph.py     # 首次规划、校验与一次修复
+│   │   │   └── conversation_graph.py  # 意图识别、工具调用与局部合并
+│   │   ├── models/              # 请求、行程及对话模型
 │   │   ├── services/
-│   │   │   ├── amap_service.py            # 高德地图 MCP 封装
-│   │   │   ├── llm_service.py             # 原 LLM 服务封装
-│   │   │   └── unsplash_service.py        # 景点图片服务
-│   │   └── config.py                      # 环境变量与配置管理
+│   │   │   ├── amap_mcp.py       # 官方 MCP SDK 连接适配
+│   │   │   ├── amap_service.py   # 高德服务入口
+│   │   │   ├── conversation_service.py  # 会话生命周期与版本管理
+│   │   │   ├── conversation_store.py    # SQLite 会话快照
+│   │   │   ├── web_search_service.py    # Tavily 工具与缓存
+│   │   │   └── unsplash_service.py      # 图片搜索
+│   │   ├── agents/              # HelloAgents 参考实现
+│   │   └── config.py
+│   ├── tests/                   # 离线回归与 API 测试
+│   ├── data/                    # 运行数据，不纳入版本控制
+│   ├── test_amap_api.py          # 高德 Web API 联调
+│   ├── test_amap_mcp.py          # 高德 MCP 联调
 │   ├── requirements.txt
 │   └── run.py
-├── frontend/
-│   ├── src/
-│   │   ├── services/
-│   │   │   └── api.ts                     # 前端 API 调用
-│   │   ├── types/
-│   │   │   └── index.ts                   # TypeScript 类型定义
-│   │   └── views/
-│   │       ├── Home.vue                   # 旅行需求表单页
-│   │       └── Result.vue                 # 行程结果展示页
-│   ├── package.json
-│   └── vite.config.ts
-├── LANGGRAPH_REWRITE.md                   # LangGraph 改写说明
+├── frontend/src/
+│   ├── components/ChatPanel.vue  # 对话、历史会话与来源展示
+│   ├── views/                   # Home.vue、Result.vue
+│   ├── services/api.ts
+│   └── types/
+├── LANGGRAPH_REWRITE.md
 └── README.md
 ```
 
-## 当前架构
+## API
 
-前端提交旅行需求后，后端通过 FastAPI 接收请求，并交给 LangGraph 工作流生成行程。
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/conversations` | 生成行程并创建会话，也可迁移已有行程 |
+| `GET` | `/api/conversations` | 查询最近创建的 100 个会话 |
+| `GET` | `/api/conversations/{id}` | 恢复消息、约束、版本与行程 |
+| `POST` | `/api/conversations/{id}/messages` | 追加需求，回答问题或调整行程 |
+| `PATCH` | `/api/conversations/{id}/plan` | 同步手动编辑并核算预算 |
+| `POST` | `/api/trip/plan` | 保留的单次规划接口，不创建会话 |
+| `GET` | `/api/poi/photo` | 按景点名称获取配图 URL |
+| `GET` | `/health` | 服务进程健康检查 |
 
-```text
-Vue 表单
-  -> POST /api/trip/plan
-  -> FastAPI
-  -> LangGraphTripPlanner
-      -> search_attractions
-      -> get_weather
-      -> search_hotels
-      -> generate_plan
-      -> validate_plan
-      -> repair_plan, 当校验失败时触发一次
-  -> TripPlanResponse
-  -> Vue 结果页展示
+追加消息示例：
+
+```json
+{
+  "content": "第二天换成博物馆，保留原酒店",
+  "expected_version": 1
+}
 ```
 
-核心实现位于：
+使用服务端返回的最新 `version` 作为下次写入的 `expected_version`。
 
-```text
-backend/app/graphs/trip_graph.py
-```
+| 状态码 | 含义 |
+| --- | --- |
+| `409` | 会话版本冲突，重新载入最新行程后重试 |
+| `422` | 输入无效，例如日期范围与旅行天数不一致 |
+| `502` | 上游调用失败，或模型输出在修复后仍不合格 |
+| `504` | 模型或外部服务响应超时 |
 
-API 入口位于：
+## 测试
 
-```text
-backend/app/api/routes/trip.py
-```
+### 离线回归
 
-## LangGraph 工作流说明
-
-`TripGraphState` 是整个工作流的状态对象，保存以下信息：
-
-- 用户原始请求 `TripRequest`
-- 景点搜索结果
-- 天气查询结果
-- 酒店搜索结果
-- 大模型原始输出
-- 校验后的 `TripPlan`
-- 错误信息
-- 修复次数
-
-工作流节点职责：
-
-```text
-search_attractions  搜索目的地相关景点
-get_weather         查询目的地天气
-search_hotels       搜索住宿相关信息
-generate_plan       调用大模型生成结构化行程
-validate_plan       使用 Pydantic 校验 TripPlan
-repair_plan         当 JSON 或字段校验失败时修复输出
-```
-
-这样设计的好处是：流程显式、状态可追踪、错误可恢复，比单个黑盒 Agent 更适合工程化和面试讲解。
-
-## 环境变量
-
-后端需要配置以下变量：
-
-```env
-AMAP_API_KEY=你的高德地图 Web 服务 API Key
-LLM_API_KEY=你的大模型 API Key
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL_ID=gpt-4o-mini
-```
-
-前端需要配置：
-
-```env
-VITE_API_BASE_URL=http://localhost:8000
-VITE_AMAP_WEB_JS_KEY=你的高德地图 Web JS API Key
-```
-
-## 后端启动
-
-项目根目录下已推荐使用 `.venv` 虚拟环境。
-
-### Windows PowerShell
+从项目根目录执行；需要已安装依赖，不需要真实 API Key 或联网调用：
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
+cd backend
+..\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -p "test_*.py"
 ```
 
-安装依赖：
+覆盖 MCP 会话清理、历史恢复、会话隔离、版本冲突、工具引用、局部修改保护、约束撤销、模型超时与输出修复。
+
+### 真实高德联调
+
+在项目根目录执行，需要有效的 Web 服务 Key 和网络：
 
 ```powershell
-python -m pip install -r backend\requirements.txt
+# 绕过 MCP，检查地理编码、景点搜索和天气
+.\.venv\Scripts\python.exe -X utf8 backend\test_amap_api.py --city 杭州 --keyword 西湖
+
+# 检查 MCP 工具发现与实际查询
+.\.venv\Scripts\python.exe -X utf8 backend\test_amap_mcp.py
 ```
 
-启动后端：
+### 前端构建
 
 ```powershell
-python backend\run.py
-```
-
-也可以不激活虚拟环境，直接运行：
-
-```powershell
-.\.venv\Scripts\python.exe backend\run.py
-```
-
-后端默认地址：
-
-```text
-http://localhost:8000
-```
-
-API 文档：
-
-```text
-http://localhost:8000/docs
-```
-
-## 前端启动
-
-```bash
 cd frontend
-npm install
-npm run dev
+npm run build
 ```
 
-前端默认地址：
-
-```text
-http://localhost:5173
-```
-
-## 主要 API
-
-```text
-POST /api/trip/plan        生成旅行计划
-GET  /api/trip/health      检查旅行规划服务
-GET  /api/map/poi          搜索 POI
-GET  /api/map/weather      查询天气
-POST /api/map/route        规划路线
-GET  /api/poi/photo        获取景点图片
-```
-
-## 前端页面说明
-
-首页 `Home.vue`：
-
-- 输入目的地城市
-- 选择开始日期和结束日期
-- 自动计算旅行天数
-- 选择交通方式
-- 选择住宿偏好
-- 勾选旅行偏好
-- 填写额外需求
-- 提交生成旅行计划
-
-结果页 `Result.vue`：
-
-- 展示行程概览
-- 展示预算明细
-- 展示每日景点、餐饮和酒店
-- 展示天气信息
-- 使用高德地图展示景点标记和路线
-- 支持编辑景点顺序和内容
-- 支持导出图片和 PDF
-
-## 面试讲解思路
-
-可以从以下角度介绍这个项目：
-
-1. 项目是一个 AI Travel Planner，采用 Vue + FastAPI 的前后端分离架构。
-2. 原版本使用 HelloAgents 顺序调用多个 Agent，新版本将核心流程改成 LangGraph 状态机。
-3. LangGraph 将复杂任务拆成多个节点，每个节点只负责一个明确职责。
-4. LangChain 负责接入 OpenAI 兼容模型，LangGraph 负责任务编排和状态流转。
-5. 使用 Pydantic 对 LLM 输出做结构化校验，避免错误 JSON 直接返回前端。
-6. 非空输出校验失败时进入 `repair_plan` 修复一次；超时或修复仍失败会明确返回服务错误，避免将占位数据当作成功行程。
-7. 前端结果页不仅展示文本，还结合地图、图片、预算和导出能力，形成完整用户体验。
-
-一句话总结：
-
-```text
-这个项目展示了如何把一个普通旅行规划应用，升级为可观测、可校验、可恢复的 LangGraph 多步骤 Agent 工作流。
-```
-
-## 学习路线
-
-建议按以下顺序阅读代码：
-
-1. `frontend/src/views/Home.vue`：理解用户输入如何形成请求。
-2. `frontend/src/services/api.ts`：理解前端如何调用后端。
-3. `backend/app/models/schemas.py`：理解请求和响应数据结构。
-4. `backend/app/api/routes/trip.py`：理解 API 如何调用规划器。
-5. `backend/app/graphs/trip_graph.py`：重点阅读 LangGraph 工作流。
-6. `frontend/src/views/Result.vue`：理解结果如何展示、编辑和导出。
+构建会先执行 `vue-tsc` 类型检查，再生成 `frontend/dist/`。
 
 ## 常见问题
 
-### 模型响应超时
+### 高德返回 `10009 / USERKEY_PLAT_NOMATCH`
 
-在 `backend/.env` 设置 `LLM_TIMEOUT=120`（每次模型调用的读取等待时间，秒）及 `LLM_MAX_RETRIES=0`。
-修改后重启后端。连接超时单独设为10秒，SDK默认不再自动重试；前端规划等待时间为10分钟，包含地图查询和必要的输出修复。
-服务日志使用 `trip` 请求编号记录生成/修复阶段、提示词字符数和调用耗时，不打印密钥或完整提示词。
-模型超时返回 HTTP 504，模型调用或输出失败返回 HTTP 502，不再返回占位行程或将空输出送入修复节点。
-仅非空但格式或行程约束错误的输出修复一次；无效请求日期或日期与天数不匹配会在调用模型前返回 HTTP 422。
-更长等待不能保证上游模型可用；仍超时时可缩短旅行天数，或检查模型服务与网络。
+后端 `AMAP_API_KEY` 必须使用 **Web 服务** 类型 Key。前端 JavaScript API Key 不能用于这些后端接口。
 
-### 多轮对话、历史会话与联网检索
+### MCP 需要手动安装或单独启动吗？
 
-首页生成行程时创建后端会话；结果页可继续发送需求，例如“第二天换成博物馆，其他日期不变”或“博物馆几点开放，需要预约吗”。
-首页的“查看历史会话”与结果页下拉框可恢复历史记录，刷新或重启后端后仍可读取。
-旧版浏览器行程可点击“将当前行程保存为会话”迁移。手动编辑保存后也会同步至后端，并重算预算。
-
-在 `backend/.env` 配置 `TAVILY_API_KEY`，然后重启后端。检索工具通过 LangChain 工具绑定由模型按需调用，
-提供开放时间、预约要求及出行公告的参考来源，不代为预约或购票。信息来自搜索摘要时会注明待核实；
-缺少密钥或检索失败不会编造规则。当前模型必须支持 OpenAI 兼容的工具调用（tool_calls）。
-
-新增 API：
+后端通过以下命令自动启动独立子进程，首次运行需要下载依赖：
 
 ```text
-POST  /api/conversations                  创建会话（request 为原 TripRequest，plan 可用于迁移已有行程）
-GET   /api/conversations                  会话列表
-GET   /api/conversations/{id}             恢复会话及行程
-POST  /api/conversations/{id}/messages     {content, expected_version}
-PATCH /api/conversations/{id}/plan         {plan, expected_version}
+uvx --with pydantic==2.10.6 amap-mcp-server==0.1.11
 ```
 
-SQLite 默认保存在 `backend/data/`，包含会话快照、LangGraph checkpoints 和一小时的搜索缓存，已加入 Git 忽略。
-可用 `CONVERSATION_DATA_DIR` 自定义目录。当前面向本地单用户、单后端实例；未加入账户鉴权，历史接口展示本实例的全部会话。
-相同会话的更新串行执行，版本过期返回 HTTP 409；新城市或新日期范围应另建会话。
-对话失败时保留原行程；超长对话向模型提供最近十二条消息及持久化需求约束，数据库保存完整可见历史。
+该高德服务依赖旧版 MCP，因此只在 **uvx 独立环境** 固定兼容的 Pydantic，后端主环境使用自己的依赖。请确保 `uvx` 在 PATH 中，且 uv 缓存目录可读写。
 
-更新依赖与运行测试：
+出现工具数量为 0 或连接失败时，先运行 MCP 联调脚本查看实际原因。当前适配器会在关闭事件循环前退出会话和子进程。
 
-```powershell
-uv pip install --python .\.venv\Scripts\python.exe -r backend\requirements.txt
-cd backend
-..\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_conversation*.py"
-```
+### 生成行程超时
 
-### 高德 MCP 出现 `Event loop is closed` 或工具数量为 0
+`LLM_TIMEOUT` 默认 120 秒，控制每次模型读取等待；连接超时为 10 秒。`LLM_MAX_RETRIES` 默认 0，避免隐式重复等待。前端等待上限为 10 分钟，涵盖地图查询与必要的输出修复。
 
-当前高德服务使用官方 MCP Python SDK 管理 stdio 会话，在事件循环关闭前退出会话和子进程。
-`amap-mcp-server==0.1.11` 固定依赖 `mcp==1.8.1`，与较新的 Pydantic 存在导入兼容问题，
-因此子进程使用 `uvx --with pydantic==2.10.6 amap-mcp-server==0.1.11`。
-该版本限制仅作用于 uvx 的独立环境，不影响后端的 Pydantic。
+日志中的 `[trip:请求编号]` 标记生成或修复阶段，记录提示词长度与耗时。超时直接返回 `504`，不会触发空输出修复。延长等待不能保证模型服务可用，仍需检查服务状态或缩短旅行天数。
 
-在项目根目录运行真实 MCP 测试（需要网络和有效的 Web 服务 Key）：
+### 图片显示占位图，或 Unsplash 返回 401
 
-```powershell
-.\.venv\Scripts\python.exe backend\test_amap_mcp.py
-```
+检查 `UNSPLASH_ACCESS_KEY`，保存后重启后端。搜索公开图片使用 Access Key，当前流程不需要 Secret Key。按名称搜索得到的图片可能不完全匹配实际景点。
 
-测试会列出工具并查询杭州景点和天气。启动或工具调用失败会明确报错，不再将空工具列表打印为初始化成功。
-修改后停止旧后端，再从 `backend` 目录运行 `..\.venv\Scripts\python.exe run.py`。
+### 联网检索没有结果
 
-本地回归测试不需要高德密钥或网络：
+检查 `TAVILY_API_KEY`、网络和模型的工具调用支持。当前工具读取搜索摘要并展示来源，检索失败时开放与预约规则应视为待核实。成功检索按查询条件缓存一小时。
 
-```powershell
-cd backend
-..\.venv\Scripts\python.exe -m unittest discover -s tests -p test_amap_mcp.py
-```
+### 数据保存在哪里？
 
-### 为什么保留 HelloAgents 代码？
+默认位于 `backend/data/`，会话快照、工作流检查点和检索缓存分别使用 SQLite 文件。可通过 `CONVERSATION_DATA_DIR` 修改目录。保留该目录即可保留会话数据；备份时应先停止后端。
 
-保留 `backend/app/agents/trip_planner_agent.py` 是为了学习对比。你可以比较两种实现：
+## 当前边界
 
-- HelloAgents 版本：更像顺序调用多个 Agent。
-- LangGraph 版本：更像显式状态机，适合复杂工作流。
+- 面向本地单用户、单后端实例，尚未加入账户鉴权；历史接口可读取本实例的全部会话，不宜直接暴露到公网。
+- 地图连线展示景点顺序，尚未实现真实道路导航或最优路径计算；部分独立 `/api/map` 接口的数据解析仍需完善。
+- 票价、酒店价格与交通预算包含估算，不能作为实时价格承诺；开放时间和预约规则以官方最新公告为准。
+- 行程调整保持目的地与日期范围；更换城市或旅行日期时应创建新会话。
 
-### 为什么需要 Pydantic 校验？
+## 项目来源与许可
 
-LLM 输出具有不确定性，可能出现字段缺失、类型错误或 JSON 格式错误。Pydantic 可以把“模型输出”约束成前端可安全使用的数据结构。
+本项目基于 [Tripya/travel_agent](https://github.com/Tripya/travel_agent) 进行学习与扩展，新增多轮会话、状态持久化、联网检索和相关交互，并改进 MCP 连接管理与模型错误处理。原 HelloAgents 实现保留作学习参考，当前主流程使用 LangGraph。
 
-### 模型失败后会返回 fallback 吗？
-
-当前接口不再用 fallback 隐藏模型超时或无效输出，而是返回明确错误；已有会话行程保持不变。fallback 构造函数保留作测试和历史参考。
-
-## License
-
-CC BY-NC-SA 4.0
-
+沿用原项目 README 标注的 **CC BY-NC-SA 4.0**。使用和分发请遵守该许可及相关服务的使用条款。
