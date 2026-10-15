@@ -7,6 +7,7 @@ from ...models.schemas import (
     ErrorResponse
 )
 from ...graphs.trip_graph import get_langgraph_trip_planner
+from ...services.planning_errors import ModelServiceError
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 
@@ -17,7 +18,7 @@ router = APIRouter(prefix="/trip", tags=["旅行规划"])
     summary="生成旅行计划",
     description="根据用户输入的旅行需求,生成详细的旅行计划"
 )
-async def plan_trip(request: TripRequest):
+def plan_trip(request: TripRequest):
     """
     生成旅行计划
 
@@ -51,6 +52,10 @@ async def plan_trip(request: TripRequest):
             data=trip_plan
         )
 
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from None
+    except ModelServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None
     except Exception as e:
         print(f"❌ 生成旅行计划失败: {str(e)}")
         import traceback

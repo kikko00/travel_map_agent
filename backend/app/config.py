@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import List
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -42,6 +43,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4"
+    llm_timeout: float = Field(default=120, gt=0, le=600)
+    llm_max_retries: int = Field(default=0, ge=0, le=2)
 
     # 日志配置
     log_level: str = "INFO"

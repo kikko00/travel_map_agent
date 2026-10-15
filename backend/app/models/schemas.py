@@ -1,7 +1,7 @@
 """数据模型定义"""
 
 from typing import List, Optional, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import date
 
 
@@ -17,6 +17,19 @@ class TripRequest(BaseModel):
     accommodation: str = Field(..., description="住宿偏好", example="经济型酒店")
     preferences: List[str] = Field(default=[], description="旅行偏好标签", example=["历史文化", "美食"])
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
+
+    @model_validator(mode="after")
+    def validate_dates(self):
+        try:
+            start = date.fromisoformat(self.start_date)
+            end = date.fromisoformat(self.end_date)
+        except ValueError:
+            raise ValueError("日期必须是有效的 YYYY-MM-DD 日期。") from None
+        if self.start_date != start.isoformat() or self.end_date != end.isoformat():
+            raise ValueError("日期必须使用 YYYY-MM-DD 格式。")
+        if end < start or (end - start).days + 1 != self.travel_days:
+            raise ValueError("结束日期不能早于开始日期，旅行天数必须与日期范围一致。")
+        return self
     
     class Config:
         json_schema_extra = {

@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from uuid import uuid4
+import httpx
+from openai import APITimeoutError
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -26,6 +30,7 @@ from ..models.schemas import (
     WeatherInfo,
 )
 from ..services.amap_service import get_amap_service
+from ..services.planning_errors import ModelTimeoutError, ModelServiceError, ModelOutputError
 
 
 class TripGraphState(TypedDict, total=False):
@@ -40,6 +45,7 @@ class TripGraphState(TypedDict, total=False):
     errors: List[str]
     validated: bool
     repair_attempts: int
+    request_id: str
 
 
 class LangGraphTripPlanner:
@@ -55,12 +61,13 @@ class LangGraphTripPlanner:
             "errors": [],
             "validated": False,
             "repair_attempts": 0,
+            "request_id": uuid4().hex[:8],
         }
         final_state = self.graph.invoke(initial_state)
         plan = final_state.get("plan")
         if isinstance(plan, TripPlan):
             return plan
-        return self._create_fallback_plan(request, final_state.get("errors", []))
+        raise ModelOutputError("模型未生成可用行程，请重试。")
 
     def _build_graph(self):
         try:
@@ -136,20 +143,10 @@ class LangGraphTripPlanner:
         )
 
     def _generate_plan_node(self, state: TripGraphState) -> TripGraphState:
-        request = state["request"]
         prompt = self._build_planning_prompt(state)
-        response = self._invoke_llm(prompt)
+        response = self._invoke_llm(prompt, stage="generate", request_id=state["request_id"])
         if not response:
-            plan = self._create_fallback_plan(
-                request,
-                self._append_error(state, "LLM returned an empty response."),
-            )
-            return self._merge_state(
-                state,
-                planner_response="",
-                plan=plan,
-                validated=True,
-            )
+            raise ModelOutputError("模型返回空内容，请检查模型配置后重试。")
         return self._merge_state(state, planner_response=response)
 
     def _validate_plan_node(self, state: TripGraphState) -> TripGraphState:
@@ -158,22 +155,25 @@ class LangGraphTripPlanner:
         try:
             data = self._extract_json(response)
             plan = TripPlan(**data)
+            if (plan.city, plan.start_date, plan.end_date, len(plan.days)) != (
+                    request.city, request.start_date, request.end_date, request.travel_days):
+                raise ValueError("行程城市、日期或天数与请求不一致。")
+            start = datetime.strptime(request.start_date, "%Y-%m-%d")
+            for i, day in enumerate(plan.days):
+                if day.day_index != i or day.date != (start + timedelta(days=i)).strftime("%Y-%m-%d"):
+                    raise ValueError("每日行程序号或日期与请求不一致。")
             return self._merge_state(state, plan=plan, validated=True)
         except Exception as exc:
             errors = self._append_error(state, f"TripPlan validation failed: {exc}")
             if state.get("repair_attempts", 0) > 0:
-                plan = self._create_fallback_plan(request, errors)
-                return self._merge_state(
-                    state,
-                    plan=plan,
-                    errors=errors,
-                    validated=False,
-                )
+                raise ModelOutputError("模型行程在一次修复后仍未通过校验，请重试。") from None
             return self._merge_state(state, errors=errors, validated=False)
 
     def _repair_plan_node(self, state: TripGraphState) -> TripGraphState:
         prompt = self._build_repair_prompt(state)
-        response = self._invoke_llm(prompt)
+        response = self._invoke_llm(prompt, stage="repair", request_id=state["request_id"])
+        if not response:
+            raise ModelOutputError("模型修复返回空内容，请重试。")
         return self._merge_state(
             state,
             planner_response=response,
@@ -211,13 +211,13 @@ User request:
 - extra_requirements: {extra}
 
 Amap attraction search result:
-{state.get("attractions_raw", "")}
+{self._compact_tool_data(state.get("attractions_raw", ""))}
 
 Amap weather result:
-{state.get("weather_raw", "")}
+{self._compact_tool_data(state.get("weather_raw", ""))}
 
 Amap hotel search result:
-{state.get("hotels_raw", "")}
+{self._compact_tool_data(state.get("hotels_raw", ""))}
 
 Rules:
 1. Include exactly {request.travel_days} day objects.
@@ -235,6 +235,9 @@ Return corrected JSON only. Do not include Markdown or explanations.
 Validation errors:
 {chr(10).join(state.get("errors", []))}
 
+Original request (city, dates and number of days must match):
+{state["request"].model_dump_json()}
+
 Required JSON schema:
 {json.dumps(TripPlan.model_json_schema(), ensure_ascii=False)}
 
@@ -242,16 +245,35 @@ Previous output:
 {state.get("planner_response", "")}
 """
 
-    def _invoke_llm(self, prompt: str) -> str:
+    @staticmethod
+    def _compact_tool_data(raw: str) -> str:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and isinstance(data.get("pois"), list):
+                data["pois"] = data["pois"][:8]
+            raw = json.dumps(data, ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
+        return raw if len(raw) <= 6000 else raw[:6000] + "\n[资料过长，后续内容省略]"
+
+    def _invoke_llm(self, prompt: str, *, stage: str = "generate", request_id: str = "") -> str:
+        started = time.monotonic()
         try:
             model = self._get_chat_model()
             if model is None:
-                return ""
+                raise ModelServiceError("未配置模型 API Key，请检查后端配置。")
+            print(f"[trip:{request_id}] LLM {stage} start; prompt_chars={len(prompt)}")
             result = model.invoke(prompt)
+            print(f"[trip:{request_id}] LLM {stage} completed; elapsed={time.monotonic() - started:.1f}s")
             return getattr(result, "content", str(result))
+        except (TimeoutError, APITimeoutError, httpx.TimeoutException):
+            print(f"[trip:{request_id}] LLM {stage} timed out; elapsed={time.monotonic() - started:.1f}s")
+            raise ModelTimeoutError("大模型响应超时，本次未保存行程。请稍后重试、缩短旅行天数，或调整 LLM_TIMEOUT。") from None
+        except ModelServiceError:
+            raise
         except Exception as exc:
-            print(f"LangGraph planner LLM call failed: {exc}")
-            return ""
+            print(f"[trip:{request_id}] LLM {stage} failed: {type(exc).__name__}")
+            raise ModelServiceError("大模型调用失败，请检查模型名称、服务地址和密钥后重试。") from None
 
     def _get_chat_model(self):
         api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -273,6 +295,8 @@ Previous output:
             base_url=base_url,
             model=model_name,
             temperature=0.4,
+            timeout=httpx.Timeout(settings.llm_timeout, connect=10, write=20, pool=10),
+            max_retries=settings.llm_max_retries,
         )
 
     def _call_amap_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
@@ -287,6 +311,7 @@ Previous output:
             )
             return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         except Exception as exc:
+            print(f"高德工具 {tool_name} 查询失败: {exc}")
             return f"Amap tool {tool_name} failed: {exc}"
 
     def _extract_json(self, response: str) -> Dict[str, Any]:
